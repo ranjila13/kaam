@@ -1,91 +1,37 @@
-// payments.js
-// Wraps the eSewa and Khalti payment gateway APIs. Defaults below point at
-// their SANDBOX/TEST endpoints — swap the *_BASE_URL / product code env
-// vars to go live later, no code changes needed.
+/**
+ * payments.js
+ * ----------------------------------------------------------------
+ * eSewa (v2 signed-form flow) and Khalti (ePayment API) integration
+ * for Kam. Both providers here point at their TEST/sandbox endpoints
+ * by default so you can develop without a live merchant account.
+ *
+ * SETUP:
+ *   Add these to kam-backend/.env:
+ *
+ *   # eSewa test credentials (these are eSewa's own published sandbox
+ *   # values — safe to use for development, everyone uses the same ones).
+ *   # Test payment page login: eSewaID 9806800001-9806800005, password
+ *   # "Nepal@123", token "123456" — see eSewa's developer docs.
+ *   ESEWA_PRODUCT_CODE=EPAYTEST
+ *   ESEWA_SECRET_KEY=8gBm/:&EnhH.1/q
+ *   ESEWA_FORM_URL=https://rc-epay.esewa.com.np/api/epay/main/v2/form
+ *   ESEWA_STATUS_URL=https://rc.esewa.com.np/api/epay/transaction/status/
+ *
+ *   # Khalti test credentials — get your own test secret key free at
+ *   # https://test-admin.khalti.com (Settings > Keys) after signing up.
+ *   KHALTI_SECRET_KEY=your_test_secret_key
+ *   KHALTI_BASE_URL=https://dev.khalti.com/api/v2
+ *
+ * When you're ready to go live, swap in your real merchant code/secret
+ * key and switch the URLs to eSewa/Khalti's production endpoints.
+ * ----------------------------------------------------------------
+ */
 
+require('dotenv').config();
 const crypto = require('crypto');
 
-// ===================== Khalti =====================
+// ============================ eSewa ============================
 
-const KHALTI_SECRET_KEY = process.env.KHALTI_SECRET_KEY; // from test-admin.khalti.com > Settings > Keys
-const KHALTI_BASE_URL = process.env.KHALTI_BASE_URL || 'https://dev.khalti.com/api/v2/epayment';
-
-// Kicks off a Khalti payment. Amount comes in as NPR (rupees); Khalti's API
-// wants paisa (rupees * 100).
-async function initiateKhaltiPayment({
-  amount,
-  purchaseOrderId,
-  purchaseOrderName,
-  returnUrl,
-  websiteUrl,
-  customerName,
-  customerEmail,
-}) {
-  if (!KHALTI_SECRET_KEY) {
-    throw new Error('KHALTI_SECRET_KEY is not set in .env');
-  }
-
-  const response = await fetch(`${KHALTI_BASE_URL}/initiate/`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Key ${KHALTI_SECRET_KEY}`,
-    },
-    body: JSON.stringify({
-      return_url: returnUrl,
-      website_url: websiteUrl,
-      amount: Math.round(amount * 100), // rupees -> paisa
-      purchase_order_id: purchaseOrderId,
-      purchase_order_name: purchaseOrderName,
-      customer_info: {
-        name: customerName || 'Kam User',
-        email: customerEmail || undefined,
-      },
-    }),
-  });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    console.error('Khalti initiate failed:', data);
-    throw new Error(data.detail || 'Khalti payment initiation failed.');
-  }
-
-  // data: { pidx, payment_url, expires_at, expires_in }
-  return data;
-}
-
-// Confirms a payment's real status directly with Khalti (never trust the
-// query string alone on the callback route).
-async function lookupKhaltiPayment(pidx) {
-  if (!KHALTI_SECRET_KEY) {
-    throw new Error('KHALTI_SECRET_KEY is not set in .env');
-  }
-
-  const response = await fetch(`${KHALTI_BASE_URL}/lookup/`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Key ${KHALTI_SECRET_KEY}`,
-    },
-    body: JSON.stringify({ pidx }),
-  });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    console.error('Khalti lookup failed:', data);
-    throw new Error(data.detail || 'Khalti payment lookup failed.');
-  }
-
-  // data: { pidx, total_amount, status, transaction_id, fee, refunded }
-  return data;
-}
-
-// ===================== eSewa =====================
-
-// eSewa's published sandbox test values. Live merchants get their own
-// product code + secret key when they register — put those in .env then.
 const ESEWA_PRODUCT_CODE = process.env.ESEWA_PRODUCT_CODE || 'EPAYTEST';
 const ESEWA_SECRET_KEY = process.env.ESEWA_SECRET_KEY || '8gBm/:&EnhH.1/q';
 const ESEWA_FORM_URL = process.env.ESEWA_FORM_URL || 'https://rc-epay.esewa.com.np/api/epay/main/v2/form';
@@ -95,14 +41,11 @@ function esewaSignature(message) {
   return crypto.createHmac('sha256', ESEWA_SECRET_KEY).update(message).digest('base64');
 }
 
-// Builds the hidden-field form the frontend needs to POST (auto-submit) to
-// eSewa's checkout page.
+// Builds the auto-submit form fields eSewa expects. The frontend should
+// render a <form> with these fields (as hidden inputs) and action=formAction,
+// then submit it — that's what actually redirects the user to eSewa.
 function buildEsewaForm({ amount, transactionUuid, successUrl, failureUrl }) {
-  const taxAmount = 0;
-  const productServiceCharge = 0;
-  const productDeliveryCharge = 0;
-  const totalAmount = amount + taxAmount + productServiceCharge + productDeliveryCharge;
-
+  const totalAmount = Number(amount).toFixed(2);
   const signedFieldNames = 'total_amount,transaction_uuid,product_code';
   const message = `total_amount=${totalAmount},transaction_uuid=${transactionUuid},product_code=${ESEWA_PRODUCT_CODE}`;
   const signature = esewaSignature(message);
@@ -110,13 +53,13 @@ function buildEsewaForm({ amount, transactionUuid, successUrl, failureUrl }) {
   return {
     formAction: ESEWA_FORM_URL,
     fields: {
-      amount,
-      tax_amount: taxAmount,
+      amount: totalAmount,
+      tax_amount: '0',
       total_amount: totalAmount,
       transaction_uuid: transactionUuid,
       product_code: ESEWA_PRODUCT_CODE,
-      product_service_charge: productServiceCharge,
-      product_delivery_charge: productDeliveryCharge,
+      product_service_charge: '0',
+      product_delivery_charge: '0',
       success_url: successUrl,
       failure_url: failureUrl,
       signed_field_names: signedFieldNames,
@@ -126,55 +69,109 @@ function buildEsewaForm({ amount, transactionUuid, successUrl, failureUrl }) {
 }
 
 // eSewa's success redirect includes ?data=<base64 JSON>. Decode it and
-// verify its signature before trusting anything in it.
+// re-verify the signature ourselves — never trust it just because it's
+// present in the query string.
 function verifyEsewaCallback(base64Data) {
   if (!base64Data) return null;
-
-  let payload;
   try {
-    const json = Buffer.from(base64Data, 'base64').toString('utf-8');
-    payload = JSON.parse(json);
+    const decoded = Buffer.from(base64Data, 'base64').toString('utf-8');
+    const payload = JSON.parse(decoded);
+
+    const fieldNames = (payload.signed_field_names || '').split(',');
+    const message = fieldNames.map((f) => `${f}=${payload[f]}`).join(',');
+    const expectedSignature = esewaSignature(message);
+
+    if (expectedSignature !== payload.signature) {
+      console.error('eSewa signature mismatch — possible tampering.');
+      return null;
+    }
+    return payload;
   } catch (err) {
-    console.error('eSewa callback: bad base64/JSON', err);
+    console.error('Failed to decode/verify eSewa callback:', err);
     return null;
   }
-
-  const { signed_field_names, signature } = payload;
-  if (!signed_field_names || !signature) return null;
-
-  const message = signed_field_names
-    .split(',')
-    .map((field) => `${field}=${payload[field]}`)
-    .join(',');
-
-  const expectedSignature = esewaSignature(message);
-  if (expectedSignature !== signature) {
-    console.error('eSewa callback: signature mismatch');
-    return null;
-  }
-
-  return payload; // includes transaction_uuid, status, total_amount, transaction_code, etc.
 }
 
-// Re-confirms the transaction status directly with eSewa's status-check
-// endpoint (the source of truth — don't rely on the callback alone).
+// Belt-and-suspenders: even after verifying the signature, ask eSewa
+// directly whether the transaction actually completed.
 async function checkEsewaStatus({ totalAmount, transactionUuid }) {
-  const params = new URLSearchParams({
-    product_code: ESEWA_PRODUCT_CODE,
-    total_amount: totalAmount,
-    transaction_uuid: transactionUuid,
+  const url = `${ESEWA_STATUS_URL}?product_code=${ESEWA_PRODUCT_CODE}&total_amount=${Number(totalAmount).toFixed(2)}&transaction_uuid=${transactionUuid}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`eSewa status check failed: ${res.status}`);
+  return res.json(); // { status: 'COMPLETE' | 'PENDING' | ..., ref_id, ... }
+}
+
+// ============================ Khalti ============================
+
+const KHALTI_SECRET_KEY = process.env.KHALTI_SECRET_KEY;
+const KHALTI_BASE_URL = process.env.KHALTI_BASE_URL || 'https://dev.khalti.com/api/v2';
+
+function requireKhaltiKey() {
+  if (!KHALTI_SECRET_KEY) {
+    throw new Error(
+      'KHALTI_SECRET_KEY is not set in .env — get a free test key at https://test-admin.khalti.com'
+    );
+  }
+}
+
+// Kicks off a Khalti payment. Returns { pidx, payment_url } — redirect
+// the browser (or open a new tab) to payment_url.
+async function initiateKhaltiPayment({
+  amount,
+  purchaseOrderId,
+  purchaseOrderName,
+  returnUrl,
+  websiteUrl,
+  customerName,
+  customerEmail,
+}) {
+  requireKhaltiKey();
+
+  const res = await fetch(`${KHALTI_BASE_URL}/epayment/initiate/`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Key ${KHALTI_SECRET_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      return_url: returnUrl,
+      website_url: websiteUrl,
+      amount: Math.round(Number(amount) * 100), // Khalti wants paisa, not rupees
+      purchase_order_id: purchaseOrderId,
+      purchase_order_name: purchaseOrderName,
+      customer_info: {
+        name: customerName || 'Kam User',
+        email: customerEmail || undefined,
+      },
+    }),
   });
 
-  const response = await fetch(`${ESEWA_STATUS_URL}?${params.toString()}`);
-  const data = await response.json();
-
-  if (!response.ok) {
-    console.error('eSewa status check failed:', data);
-    return { status: 'FAILED' };
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Khalti initiate failed: ${JSON.stringify(data)}`);
   }
+  return data; // { pidx, payment_url, ... }
+}
 
-  // data: { product_code, transaction_uuid, total_amount, status, ref_id }
-  return data;
+// Confirms a payment's real status directly with Khalti — never trust
+// the ?status= query param on the return_url redirect by itself.
+async function lookupKhaltiPayment(pidx) {
+  requireKhaltiKey();
+
+  const res = await fetch(`${KHALTI_BASE_URL}/epayment/lookup/`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Key ${KHALTI_SECRET_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ pidx }),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Khalti lookup failed: ${JSON.stringify(data)}`);
+  }
+  return data; // { status: 'Completed' | 'Pending' | ..., transaction_id, ... }
 }
 
 module.exports = {
